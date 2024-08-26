@@ -4,6 +4,7 @@ from qualitor_helpers import login, get_ticket_data, get_tickets
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from db import get_db  
+from graph_generator import generate_report, send_report_via_twilio
 
 class ChatBot:
     def __init__(self):
@@ -34,17 +35,18 @@ class State(ABC):
 
 class StartState(State):
     def handle_request(self, message):
-        if message.lower() in ['ola', 'oi', 'oi, tudo bem?', 'ola, tudo bem?',"olá"]:
-            return ['Olá! Bem vindo à nossa empresa! Por favor, digite seu número de contrato.']
+        if message.lower() in ['ola', 'oi', 'oi, tudo bem?', 'ola, tudo bem?', "olá"]:
+            return ['Olá! Bem-vindo à nossa empresa! Por favor, digite seu número de contrato.']
         else:
-            client_info = self.verify_contract(message)
+            client_info = self.verify_contract(message.strip())
             if client_info:
                 client_name, client_code = client_info
                 self.context.client_name = client_name
                 self.context.client_code = client_code
                 auto_responses = self.transition_to(SelectOptionState)
                 return [
-                    f'Contrato verificado para {self.context.client_name}! Por favor, escolha uma opção:\n1. Ver chamados\n'] + auto_responses
+                    f'Contrato verificado para {self.context.client_name}! Por favor, escolha uma opção:\n1. Ver chamados\n2. Gerar relatório'
+                ] + auto_responses
             else:
                 return ['Contrato não encontrado. Por favor, verifique e digite novamente.']
 
@@ -55,24 +57,23 @@ class StartState(State):
         result = cursor.fetchone()
         return (result[0], result[1]) if result else None
 
-
 class SelectOptionState(State):
     def handle_request(self, message):
-        if message.strip() == '1':
+        option = message.strip()
+        if option == '1':
             auto_responses = self.transition_to(GetCallsState)
             return auto_responses
-        elif message.strip() == '2':
-            auto_responses = self.transition_to(GenerateReportState)
-            return auto_responses
+        elif option == '2':
+            auto_responses = self.transition_to(ChooseReportTypeState)
+            return ['Você deseja um relatório mensal ou anual?\n1. Mensal\n2. Anual'] + auto_responses
         else:
-            return ['Opção inválida. Por favor, tente novamente.']
+            return ['Opção inválida. Por favor, escolha uma opção:\n1. Ver chamados\n2. Gerar relatório']
 
 class GetCallsState(State):
     def handle_request(self, message):
         return self.auto_respond()
 
     def auto_respond(self):
-        print("Auto-responding with calls list")
         response_messages = ["Por favor, aguarde enquanto obtemos os chamados..."]
 
         auth_token = login()
@@ -81,140 +82,144 @@ class GetCallsState(State):
         items = root.findall('.//dataitem')
 
         if items:
-            sorted_items = sorted(items, key=lambda x: datetime.strptime(x.find('dtchamado').text if x.find('dtchamado') is not None else '1900-01-01 00:00', '%Y-%m-%d %H:%M'), reverse=True)[:10]
-            chamados_msg = "\n".join([f"{item.find('cdchamado').text}: {item.find('nmtitulochamado').text}" for item in sorted_items])
+            sorted_items = sorted(
+                items,
+                key=lambda x: datetime.strptime(
+                    x.find('dtchamado').text if x.find('dtchamado') is not None else '1900-01-01 00:00',
+                    '%Y-%m-%d %H:%M'
+                ),
+                reverse=True
+            )[:10]
+            chamados_msg = "\n".join([
+                f"{item.find('cdchamado').text}: {item.find('nmtitulochamado').text}"
+                for item in sorted_items
+            ])
             response_messages.append(chamados_msg)
         else:
             response_messages.append("Não há chamados registrados.")
 
-        response_messages.append("Por favor, digite o número do chamado desejado.")
+        response_messages.append("Por favor, digite o número do chamado desejado ou digite 'menu' para voltar ao menu principal.")
         self.transition_to(SelectCallState)
-        print("Final message to send:", response_messages)
         return response_messages
 
 class SelectCallState(State):
     def handle_request(self, message):
+        if message.strip().lower() == 'menu':
+            auto_responses = self.transition_to(SelectOptionState)
+            return ['Retornando ao menu principal...'] + auto_responses
         try:
-            call_number = int(message)
+            call_number = int(message.strip())
             self.context.set_call_number(call_number)
             auto_response = self.transition_to(GetCallUpdatesState)
             return [
-                'Número de chamado verificado!\nPor favor, aguarde enquanto obtemos as atualizações...'] + auto_response
+                'Número de chamado verificado!\nPor favor, aguarde enquanto obtemos as atualizações...'
+            ] + auto_response
         except ValueError:
-            return ['Número inválido. Por favor, digite um número de chamado válido.']
+            return ['Número inválido. Por favor, digite um número de chamado válido ou digite "menu" para voltar ao menu principal.']
 
 class GetCallUpdatesState(State):
     def handle_request(self, message):
         return self.auto_respond()
 
     def auto_respond(self):
-        updates = self.get_call_updates(self.context.contract_id, self.context.call_number)
+        updates = self.get_call_updates(self.context.call_number)
         response_messages = []
         if updates:
-            response_messages.append(f"Últimas atualizações do chamado {self.context.call_number}: {updates}")
+            response_messages.append(f"Últimas atualizações do chamado {self.context.call_number}:\n{updates}")
         else:
             response_messages.append("Não há atualizações disponíveis para este chamado.")
-        self.transition_to(SelectReturnState)
+        response_messages.append("Deseja:\n1. Ver outro chamado\n2. Voltar ao menu principal\n3. Encerrar a sessão")
+        self.transition_to(PostCallOptionsState)
         return response_messages
 
-    def get_call_updates(self, contract_id, call_number):
+    def get_call_updates(self, call_number):
         auth_token = login()
         updates_response = get_ticket_data(auth_token, call_number)
-        fields = ['cdchamado', 'nmtitulochamado', 'dataultimoacompanhamento', 'nmsituacao']
         root = ET.fromstring(updates_response)
         item = root.find('.//dataitem')
 
         if item:
-            return f"Chamado {item.find('cdchamado').text}: {item.find('nmtitulochamado').text} - \nÚltima atualização em {item.find('dataultimoacompanhamento').text}:\n {item.find('dsultimoacompanhamento').text}"
+            cdchamado = item.find('cdchamado').text or 'N/A'
+            nmtitulochamado = item.find('nmtitulochamado').text or 'N/A'
+            dataultimoacompanhamento = item.find('dataultimoacompanhamento').text or 'N/A'
+            dsultimoacompanhamento = item.find('dsultimoacompanhamento').text or 'N/A'
+            return (
+                f"Chamado {cdchamado}: {nmtitulochamado}\n"
+                f"Última atualização em {dataultimoacompanhamento}:\n{dsultimoacompanhamento}"
+            )
         else:
-            return "Chamado não encontrado."
+            return None
 
-class SelectReturnState(State):
+class PostCallOptionsState(State):
     def handle_request(self, message):
-        if message.strip() == '1':
+        option = message.strip()
+        if option == '1':
+            auto_responses = self.transition_to(GetCallsState)
+            return auto_responses
+        elif option == '2':
             auto_responses = self.transition_to(SelectOptionState)
-            return ["Retornando ao menu principal..."] + [
-                "Por favor, escolha uma opção:\n1. Ver chamados\n2. Gerar relatório"] + auto_responses
-
-        elif message.strip() == '2':
+            return ['Retornando ao menu principal...'] + auto_responses
+        elif option == '3':
             auto_responses = self.transition_to(EndState)
-            return ["Encerrando a sessão. Obrigado!"] + auto_responses
+            return ['Encerrando a sessão. Obrigado!']
         else:
-            return ["Opção inválida. Por favor, digite 1 para retornar ao menu principal ou 2 para encerrar a sessão."]
+            return ['Opção inválida. Por favor, escolha uma das opções abaixo:\n1. Ver outro chamado\n2. Voltar ao menu principal\n3. Encerrar a sessão']
 
-    def auto_respond(self):
-        return ["Opções: \n1. Retornar ao menu principal\n2. Encerrar a sessão."]
+class ChooseReportTypeState(State):
+    def handle_request(self, message):
+        option = message.strip()
+        if option == '1':
+            auto_responses = self.transition_to(SelectMonthState)
+            return ['Por favor, digite o mês desejado (1-12):'] + auto_responses
+        elif option == '2':
+            self.context.report_type = 'anual'
+            auto_responses = self.transition_to(GenerateReportState)
+            return ['Gerando relatório anual. Por favor, aguarde...'] + auto_responses
+        else:
+            return ['Opção inválida. Por favor, escolha uma opção:\n1. Mensal\n2. Anual']
+
+class SelectMonthState(State):
+    def handle_request(self, message):
+        try:
+            month = int(message.strip())
+            if 1 <= month <= 12:
+                self.context.report_type = 'mensal'
+                self.context.report_month = month
+                auto_responses = self.transition_to(GenerateReportState)
+                return [f'Gerando relatório do mês {month}. Por favor, aguarde...'] + auto_responses
+            else:
+                return ['Mês inválido. Por favor, digite um número entre 1 e 12:']
+        except ValueError:
+            return ['Entrada inválida. Por favor, digite um número entre 1 e 12:']
 
 class GenerateReportState(State):
     def handle_request(self, message):
-        response_messages = self.auto_respond()
-        return response_messages
+        return self.auto_respond()
 
     def auto_respond(self):
-        chamados = self.get_calls(self.context.contract_id)
-        if not chamados:
-            return ["Não há chamados registrados para este contrato."]
+        report_type = self.context.report_type
+        client_code = self.context.client_code
+        phone_number = self.context.phone_number
 
-        excel_path = self.generate_excel(chamados)
-        pdf_path = self.convert_excel_to_pdf(excel_path)
-        self.send_pdf_via_twilio(pdf_path, self.context.phone_number)
+        try:
+            if report_type == 'mensal':
+                month = self.context.report_month
+                excel_path, graph_path = generate_report(client_code, report_type='mensal', month=month)
+                month_name = datetime(1900, month, 1).strftime('%B').capitalize()
+                send_report_via_twilio(phone_number, excel_path, graph_path)
+                response = f'Relatório mensal de {month_name} gerado e enviado com sucesso!'
+            elif report_type == 'anual':
+                excel_path, graph_path = generate_report(client_code, report_type='anual')
+                send_report_via_twilio(phone_number, excel_path, graph_path)
+                response = 'Relatório anual gerado e enviado com sucesso!'
+            else:
+                response = 'Tipo de relatório desconhecido.'
+        except Exception as e:
+            print(f"Erro ao gerar ou enviar relatório: {e}")
+            response = 'Ocorreu um erro ao gerar o relatório. Por favor, tente novamente mais tarde.'
 
         self.transition_to(SelectOptionState)
-        return [
-            "Relatório gerado e enviado para o seu número. Por favor, escolha uma opção:\n1. Ver chamados\n2. Gerar relatório"]
-
-    def get_calls(self, contract_id):
-        auth_token = login()
-        tickets_response = get_tickets(auth_token, self.context.contract_id)
-
-        root = ET.fromstring(tickets_response)
-        items = root.findall('.//dataitem')
-
-        chamados = []
-        if items:
-            for item in items:
-                chamados.append({
-                    'id': item.find('cdchamado').text,
-                    'descricao': item.find('descricao').text,
-                    'status': item.find('status').text,
-                    'data_criacao': item.find('dtchamado').text
-                })
-        return chamados
-
-    def generate_excel(self, chamados):
-        import pandas as pd
-        data = [(chamado['id'], chamado['descricao'], chamado['status'], chamado['data_criacao']) for chamado in chamados]
-        df_chamados = pd.DataFrame(data, columns=['ID', 'Descrição', 'Status', 'Data de Criação'])
-        excel_path = 'chamados.xlsx'
-        df_chamados.to_excel(excel_path, index=False)
-        return excel_path
-
-    def convert_excel_to_pdf(self, excel_path):
-        import pdfkit
-        pdf_path = 'chamados.pdf'
-        pdfkit.from_file(excel_path, pdf_path)
-        return pdf_path
-
-    def send_pdf_via_twilio(self, pdf_path, to_phone_number):
-        from twilio.rest import Client
-        import os
-        from dotenv import load_dotenv
-
-        load_dotenv()  # Inicialização do cliente Twilio
-        account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-        auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-        client = Client(account_sid, auth_token)
-
-        media_url = f'http://your_domain.com/{pdf_path}'
-
-        message = client.messages.create(
-            body='Aqui está o relatório de chamados em PDF.',
-            from_='+1234567890',  # Seu número Twilio
-            to=to_phone_number,
-            media_url=[media_url]
-        )
-
-        return message.sid
+        return [response, 'Deseja realizar outra operação?\n1. Sim\n2. Não']
 
 class EndState(State):
     def handle_request(self, message):
